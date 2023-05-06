@@ -1,7 +1,7 @@
 /*
  * Explicit free list implementation of malloc and free.
  * First fit placement with immediate coalescing.
- * Minimum block size is 32 bytes.
+ * Minimum block size is 24 bytes.
  */
 #include "mm.h"
 
@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
 
 #include "memlib.h"
 
@@ -38,15 +39,18 @@
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
 
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+typedef uint32_t INTERNAL_SIZE_T;
+#define INTERNAL_SIZE_T_SIZE (sizeof(INTERNAL_SIZE_T))
+#define HEADER_SIZE INTERNAL_SIZE_T_SIZE
+#define FOOTER_SIZE INTERNAL_SIZE_T_SIZE
 
-#define SIZE_PTR(p) ((size_t *)(((char *)(p)) - SIZE_T_SIZE))
+#define SIZE_PTR(p) ((size_t *)(((char *)(p)) - HEADER_SIZE))
 
 #define POINTER_SIZE (ALIGN(sizeof(void *)))
 
-/* Read and write a size_t value at address p */
-#define GET(p) (*(size_t *)(p))
-#define PUT(p, val) (*(size_t *)(p) = (val))
+/* Read and write a INTERNAL_SIZE_T value at address p */
+#define GET(p) (*(INTERNAL_SIZE_T *)(p))
+#define PUT(p, val) (*(INTERNAL_SIZE_T *)(p) = (val))
 /* Read and write a pointer at address p */
 #define GET_PTR(p) (*(void **)(p))
 #define PUT_PTR(p, val) (*(void **)(p) = (val))
@@ -54,7 +58,7 @@
 /* Pack a size, allocated bit, and allocated bit of previous block into a word */
 #define PACK(size, alloc, prev_alloc) ((size) | (alloc) | (prev_alloc) << 1)
 
-#define MIN_BLOCK_SIZE (SIZE_T_SIZE + 2 * POINTER_SIZE + SIZE_T_SIZE)
+#define MIN_BLOCK_SIZE (HEADER_SIZE + 2 * POINTER_SIZE + FOOTER_SIZE)
 
 /* Read and write the size and allocated fields from address p */
 #define GET_SIZE(p) (GET(p) & ~0x7)
@@ -64,22 +68,22 @@
 #define GET_PREV_ALLOC(p) ((GET(p) & 0x2) >> 1)
 #define SET_PREV_ALLOC(p, val) (PUT(p, (GET(p) & ~0x2) | (val) << 1))
 
-#define GET_PAYLOAD(p) ((char *)(p) + SIZE_T_SIZE)
+#define GET_PAYLOAD(p) ((char *)(p) + HEADER_SIZE)
 
 #define GET_NEXT_BLOCK(p) ((char *)(p) + GET_SIZE(p))
 
-#define PREV_FOOTER_PTR(p) ((char *)(p) - SIZE_T_SIZE)
+#define PREV_FOOTER_PTR(p) ((char *)(p) - FOOTER_SIZE)
 #define GET_PREV_FOOTER(p) (GET(PREV_FOOTER_PTR(p)))
 #define GET_PREV_BLOCK(p, prev_footer) ((char *)(p) - ((prev_footer) & ~0x7))
 
-#define FOOTER_PTR(p) ((char *)(p) + GET_SIZE(p) - SIZE_T_SIZE)
+#define FOOTER_PTR(p) ((char *)(p) + GET_SIZE(p) - FOOTER_SIZE)
 #define SET_FOOTER(p) (PUT(FOOTER_PTR(p), GET(p)))
 
 /* Forward block and backward block in the list of free blocks */
-#define FWD_BLOCK_PTR(p) ((char *)(p) + SIZE_T_SIZE)
+#define FWD_BLOCK_PTR(p) ((char *)(p) + HEADER_SIZE)
 #define GET_FWD_BLOCK(p) (GET_PTR(FWD_BLOCK_PTR(p)))
 #define SET_FWD_BLOCK(p, fwd) (PUT_PTR(FWD_BLOCK_PTR(p), (fwd)))
-#define BCK_BLOCK_PTR(p) ((char *)(p) + SIZE_T_SIZE + POINTER_SIZE)
+#define BCK_BLOCK_PTR(p) ((char *)(p) + HEADER_SIZE + POINTER_SIZE)
 #define GET_BCK_BLOCK(p) (GET_PTR(BCK_BLOCK_PTR(p)))
 #define SET_BCK_BLOCK(p, bck) (PUT_PTR(BCK_BLOCK_PTR(p), (bck)))
 
@@ -97,10 +101,11 @@ static char *heap_head = NULL;
  * mm_init - Called when a new trace starts.
  */
 int mm_init(void) {
-  heap_head = mem_sbrk(PROLOGUE_SIZE + SIZE_T_SIZE);
+  int padding = ALIGN(HEADER_SIZE) - HEADER_SIZE;
+  heap_head = mem_sbrk(PROLOGUE_SIZE + padding + HEADER_SIZE);
   SET_LIST_HEAD(NULL);
   SET_LIST_TAIL(NULL);
-  PUT(heap_head + PROLOGUE_SIZE, PACK(0, 1, 1));
+  PUT(heap_head + PROLOGUE_SIZE + padding, PACK(0, 1, 1));
   return 0;
 }
 
@@ -144,7 +149,7 @@ void *malloc(size_t size) {
     return NULL;
   void *p = GET_LIST_HEAD();
   while (p != NULL) {
-    if (GET_SIZE(p) >= size + SIZE_T_SIZE) {
+    if (GET_SIZE(p) >= size + HEADER_SIZE) {
       break;
     }
     p = GET_FWD_BLOCK(p);
@@ -152,7 +157,7 @@ void *malloc(size_t size) {
   if (p != NULL) {
     remove_from_free_list(p);
 
-    size_t need_size = max(ALIGN(size + SIZE_T_SIZE), MIN_BLOCK_SIZE);
+    size_t need_size = max(ALIGN(HEADER_SIZE + size), MIN_BLOCK_SIZE);
     size_t remain = GET_SIZE(p) - need_size;
     if (remain >= MIN_BLOCK_SIZE) {
       // split block
@@ -170,14 +175,14 @@ void *malloc(size_t size) {
     SET_ALLOC(p, 1);
     return GET_PAYLOAD(p);
   } else {
-    int newsize = max(ALIGN(size + SIZE_T_SIZE), MIN_BLOCK_SIZE);
+    int newsize = max(ALIGN(HEADER_SIZE + size), MIN_BLOCK_SIZE);
     // printf("size: %d, newsize %d\n", size, newsize);
     // fflush(stdout);
     char *p = mem_sbrk(newsize);
     if ((long)p < 0)
       return NULL;
     else {
-      p -= SIZE_T_SIZE;
+      p -= HEADER_SIZE;
       // check_tail_block(p);
       SET_SIZE(p, newsize);
       SET_ALLOC(p, 1);
@@ -306,7 +311,7 @@ void mm_checkheap(int verbose) {
   char *p = head;
   while (p != NULL) {
     if (verbose > 2) {
-      printf("free block: %p, size: %lu\n", p, GET_SIZE(p));
+      printf("free block: %p, size: %u\n", p, GET_SIZE(p));
     }
     if (GET_ALLOC(p) != 0) {
       fprintf(stderr, "free block %p is not free\n", p);
