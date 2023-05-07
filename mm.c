@@ -1,7 +1,7 @@
 /*
  * Segregated fits malloc implementation.
  * First fit placement with immediate coalescing.
- * Minimum block size is 24 bytes.
+ * Minimum block size is 16 bytes.
  */
 #include "mm.h"
 
@@ -44,16 +44,37 @@ typedef uint32_t INTERNAL_SIZE_T;
 #define HEADER_SIZE INTERNAL_SIZE_T_SIZE
 #define FOOTER_SIZE INTERNAL_SIZE_T_SIZE
 
-#define SIZE_PTR(p) ((size_t *)(((char *)(p)) - HEADER_SIZE))
-
-#define POINTER_SIZE (ALIGN(sizeof(void *)))
-
 /* Read and write a INTERNAL_SIZE_T value at address p */
 #define GET(p) (*(INTERNAL_SIZE_T *)(p))
 #define PUT(p, val) (*(INTERNAL_SIZE_T *)(p) = (val))
-/* Read and write a pointer at address p */
-#define GET_PTR(p) (*(void **)(p))
-#define PUT_PTR(p, val) (*(void **)(p) = (val))
+
+#define SIZE_PTR(p) ((INTERNAL_SIZE_T *)(((char *)(p)) - HEADER_SIZE))
+
+static char *heap_head = NULL;
+struct free_list {
+  void *head;
+  void *tail;
+};
+
+#define PROLOGUE_SIZE (32 * sizeof(struct free_list))
+
+typedef uint32_t INTERNAL_PTR_T;
+#define POINTER_SIZE (sizeof(INTERNAL_PTR_T))
+
+static inline INTERNAL_PTR_T to_internal_ptr(void *p) {  //
+  return p == NULL ? 0 : (char *)p - heap_head;
+}
+static inline void *to_void_ptr(INTERNAL_PTR_T p) {  //
+  return p == 0 ? NULL : heap_head + p;
+}
+/* Read a INTERNAL_PTR at address p */
+static inline INTERNAL_PTR_T GET_PTR(void *p) {  //
+  return *(INTERNAL_PTR_T *)p;
+}
+/* Write a INTERNAL_PTR at address p */
+static inline void PUT_PTR(void *p, INTERNAL_PTR_T val) {  //
+  *(INTERNAL_PTR_T *)p = val;
+}
 
 /* Pack a size, allocated bit, and allocated bit of previous block into a word */
 #define PACK(size, alloc, prev_alloc) ((size) | (alloc) | (prev_alloc) << 1)
@@ -72,7 +93,7 @@ typedef uint32_t INTERNAL_SIZE_T;
 
 #define GET_NEXT_BLOCK(p) ((char *)(p) + GET_SIZE(p))
 
-#define PREV_FOOTER_PTR(p) ((char *)(p) - FOOTER_SIZE)
+#define PREV_FOOTER_PTR(p) ((char *)(p)-FOOTER_SIZE)
 #define GET_PREV_FOOTER(p) (GET(PREV_FOOTER_PTR(p)))
 #define GET_PREV_BLOCK(p, prev_footer) ((char *)(p) - ((prev_footer) & ~0x7))
 
@@ -80,26 +101,24 @@ typedef uint32_t INTERNAL_SIZE_T;
 #define SET_FOOTER(p) (PUT(FOOTER_PTR(p), GET(p)))
 
 /* Forward block and backward block in the list of free blocks */
-#define FWD_BLOCK_PTR(p) ((char *)(p) + HEADER_SIZE)
-#define GET_FWD_BLOCK(p) (GET_PTR(FWD_BLOCK_PTR(p)))
-#define SET_FWD_BLOCK(p, fwd) (PUT_PTR(FWD_BLOCK_PTR(p), (fwd)))
-#define BCK_BLOCK_PTR(p) ((char *)(p) + HEADER_SIZE + POINTER_SIZE)
-#define GET_BCK_BLOCK(p) (GET_PTR(BCK_BLOCK_PTR(p)))
-#define SET_BCK_BLOCK(p, bck) (PUT_PTR(BCK_BLOCK_PTR(p), (bck)))
-
-static char *heap_head = NULL;
-struct free_list {
-  void *head;
-  void *tail;
-};
-
-#define PROLOGUE_SIZE (32 * sizeof(struct free_list))
-
-// #define SET_LIST_HEAD(p) (PUT_PTR(heap_head, (void *)p))
-// #define SET_LIST_TAIL(p) (PUT_PTR(heap_head + POINTER_SIZE, (void *)p))
-
-// #define GET_LIST_HEAD() (GET_PTR(heap_head))
-// #define GET_LIST_TAIL() (GET_PTR(heap_head + POINTER_SIZE))
+static inline void *FWD_BLOCK_PTR(void *p) {  //
+  return (char *)p + HEADER_SIZE;
+}
+static inline void *GET_FWD_BLOCK(void *p) {  //
+  return to_void_ptr(GET_PTR(FWD_BLOCK_PTR(p)));
+}
+static inline void SET_FWD_BLOCK(void *p, void *fwd) {  //
+  PUT_PTR(FWD_BLOCK_PTR(p), to_internal_ptr(fwd));
+}
+static inline void *BCK_BLOCK_PTR(void *p) {  //
+  return (char *)p + HEADER_SIZE + POINTER_SIZE;
+}
+static inline void *GET_BCK_BLOCK(void *p) {  //
+  return to_void_ptr(GET_PTR(BCK_BLOCK_PTR(p)));
+}
+static inline void SET_BCK_BLOCK(void *p, void *bck) {  //
+  PUT_PTR(BCK_BLOCK_PTR(p), to_internal_ptr(bck));
+}
 
 static inline uint32_t __log2(const uint32_t x) {
   uint32_t y;
@@ -224,11 +243,11 @@ outer:
 void free(void *ptr) {
   // printf("free %p\n", ptr);
   if (ptr == NULL) return;
-  size_t *p = SIZE_PTR(ptr);
+  INTERNAL_SIZE_T *p = SIZE_PTR(ptr);
   // if (GET_ALLOC(p) == 0) return;
   char *next_block = GET_NEXT_BLOCK(p);
-  size_t next_block_alloc = GET_ALLOC(next_block);
-  size_t prev_block_alloc = GET_PREV_ALLOC(p);
+  INTERNAL_SIZE_T next_block_alloc = GET_ALLOC(next_block);
+  INTERNAL_SIZE_T prev_block_alloc = GET_PREV_ALLOC(p);
   if (prev_block_alloc) {
     if (next_block_alloc) {
       // both prev and next block are allocated, no coalescing
