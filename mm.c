@@ -1,5 +1,5 @@
 /*
- * Explicit free list implementation of malloc and free.
+ * Segregated fits malloc implementation.
  * First fit placement with immediate coalescing.
  * Minimum block size is 24 bytes.
  */
@@ -7,11 +7,11 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdint.h>
 
 #include "memlib.h"
 
@@ -88,14 +88,30 @@ typedef uint32_t INTERNAL_SIZE_T;
 #define SET_BCK_BLOCK(p, bck) (PUT_PTR(BCK_BLOCK_PTR(p), (bck)))
 
 static char *heap_head = NULL;
+struct free_list {
+  void *head;
+  void *tail;
+};
 
-#define PROLOGUE_SIZE (2 * POINTER_SIZE)
+#define PROLOGUE_SIZE (32 * sizeof(struct free_list))
 
-#define SET_LIST_HEAD(p) (PUT_PTR(heap_head, (void *)p))
-#define SET_LIST_TAIL(p) (PUT_PTR(heap_head + POINTER_SIZE, (void *)p))
+// #define SET_LIST_HEAD(p) (PUT_PTR(heap_head, (void *)p))
+// #define SET_LIST_TAIL(p) (PUT_PTR(heap_head + POINTER_SIZE, (void *)p))
 
-#define GET_LIST_HEAD() (GET_PTR(heap_head))
-#define GET_LIST_TAIL() (GET_PTR(heap_head + POINTER_SIZE))
+// #define GET_LIST_HEAD() (GET_PTR(heap_head))
+// #define GET_LIST_TAIL() (GET_PTR(heap_head + POINTER_SIZE))
+
+static inline uint32_t __log2(const uint32_t x) {
+  uint32_t y;
+  asm("bsr %1, %0" : "=r"(y) : "r"(x));
+  return y;
+}
+static inline struct free_list *get_list(uint32_t idx) {  //
+  return ((struct free_list *)heap_head) + idx;
+}
+static inline struct free_list *get_list_of(void *p) {  //
+  return get_list(__log2(GET_SIZE(p)));
+}
 
 /*
  * mm_init - Called when a new trace starts.
@@ -103,41 +119,50 @@ static char *heap_head = NULL;
 int mm_init(void) {
   int padding = ALIGN(HEADER_SIZE) - HEADER_SIZE;
   heap_head = mem_sbrk(PROLOGUE_SIZE + padding + HEADER_SIZE);
-  SET_LIST_HEAD(NULL);
-  SET_LIST_TAIL(NULL);
+  struct free_list *l = (struct free_list *)heap_head;
+  for (int i = 0; i < 32; i++) {
+    l->head = NULL;
+    l->tail = NULL;
+    l++;
+  }
   PUT(heap_head + PROLOGUE_SIZE + padding, PACK(0, 1, 1));
   return 0;
 }
 
 static inline void remove_from_free_list(void *p) {
+  struct free_list *l = NULL;
   void *backword = GET_BCK_BLOCK(p);
   void *forward = GET_FWD_BLOCK(p);
   if (backword != NULL) {
     SET_FWD_BLOCK(backword, forward);
   } else {
-    SET_LIST_HEAD(forward);
+    l = get_list_of(p);
+    l->head = forward;
   }
   if (forward != NULL) {
     SET_BCK_BLOCK(forward, backword);
   } else {
-    SET_LIST_TAIL(backword);
+    if (l == NULL) {
+      l = get_list_of(p);
+    }
+    l->tail = backword;
   }
 }
 
-static inline size_t max(size_t a, size_t b) { return a > b ? a : b; }
+static inline INTERNAL_SIZE_T max(INTERNAL_SIZE_T a, INTERNAL_SIZE_T b) { return a > b ? a : b; }
 static inline void check_tail_block(void *p) {
   assert(GET_SIZE(p) == 0);
   assert(GET_ALLOC(p) == 1);
 }
 /* Insert a block to the head of the free list */
 static inline void insert_to_free_list(void *p) {
-  void *head = GET_LIST_HEAD();
-  if (head != NULL) {
-    SET_BCK_BLOCK(head, p);
+  struct free_list *l = get_list_of(p);
+  if (l->head != NULL) {
+    SET_BCK_BLOCK(l->head, p);
   }
-  SET_FWD_BLOCK(p, head);
+  SET_FWD_BLOCK(p, l->head);
   SET_BCK_BLOCK(p, NULL);
-  SET_LIST_HEAD(p);
+  l->head = p;
 }
 /*
  * malloc - Allocate a block.
@@ -145,19 +170,21 @@ static inline void insert_to_free_list(void *p) {
  */
 void *malloc(size_t size) {
   // printf("malloc %d\n", size);
-  if (size == 0)
-    return NULL;
-  void *p = GET_LIST_HEAD();
-  while (p != NULL) {
-    if (GET_SIZE(p) >= size + HEADER_SIZE) {
-      break;
+  if (size == 0) return NULL;
+  INTERNAL_SIZE_T need_size = max(ALIGN(HEADER_SIZE + size), MIN_BLOCK_SIZE);
+  void *p;
+  for (int i = __log2(need_size); i < 32; i++) {
+    p = get_list(i)->head;
+    while (p != NULL) {
+      if (GET_SIZE(p) >= need_size) {
+        goto outer;
+      }
+      p = GET_FWD_BLOCK(p);
     }
-    p = GET_FWD_BLOCK(p);
   }
+outer:
   if (p != NULL) {
     remove_from_free_list(p);
-
-    size_t need_size = max(ALIGN(HEADER_SIZE + size), MIN_BLOCK_SIZE);
     size_t remain = GET_SIZE(p) - need_size;
     if (remain >= MIN_BLOCK_SIZE) {
       // split block
@@ -175,18 +202,17 @@ void *malloc(size_t size) {
     SET_ALLOC(p, 1);
     return GET_PAYLOAD(p);
   } else {
-    int newsize = max(ALIGN(HEADER_SIZE + size), MIN_BLOCK_SIZE);
-    // printf("size: %d, newsize %d\n", size, newsize);
+    // printf("size: %d, need_size %d\n", size, newsize);
     // fflush(stdout);
-    char *p = mem_sbrk(newsize);
+    char *p = mem_sbrk(need_size);
     if ((long)p < 0)
       return NULL;
     else {
       p -= HEADER_SIZE;
       // check_tail_block(p);
-      SET_SIZE(p, newsize);
+      SET_SIZE(p, need_size);
       SET_ALLOC(p, 1);
-      PUT(p + newsize, PACK(0, 1, 1));
+      PUT(p + need_size, PACK(0, 1, 1));
       return GET_PAYLOAD(p);
     }
   }
@@ -227,16 +253,20 @@ void free(void *ptr) {
     if (next_block_alloc) {
       // prev block is free, next block is allocated
       // coalesce with prev block
+      remove_from_free_list(prev_block);
       SET_PREV_ALLOC(next_block, 0);
       SET_SIZE(prev_block, GET_SIZE(prev_block) + GET_SIZE(p));
       SET_FOOTER(prev_block);
+      insert_to_free_list(prev_block);
     } else {
       // both prev and next block are free,
       // remove next block from free list,
       // merge (p + next_block) to prev block
+      remove_from_free_list(prev_block);
       remove_from_free_list(next_block);
       SET_SIZE(prev_block, GET_SIZE(prev_block) + GET_SIZE(p) + GET_SIZE(next_block));
       SET_FOOTER(prev_block);
+      insert_to_free_list(prev_block);
     }
   }
 }
@@ -301,32 +331,33 @@ void mm_checkheap(int verbose) {
     printf("mm_checkheap - mem_brk: %p\n", mem_brk);
   }
 
-  void *head = GET_LIST_HEAD();
-  void *tail = GET_LIST_TAIL();
-  if (verbose > 2) {
-    printf("free list head: %p\n", head);
-    printf("free list tail: %p\n", tail);
-  }
-  // iterate through the free list
-  char *p = head;
-  while (p != NULL) {
+  for (int i = 0; i < 32; i++) {
+    struct free_list *l = get_list(i);
     if (verbose > 2) {
-      printf("free block: %p, size: %u\n", p, GET_SIZE(p));
+      printf("free list head: %p\n", l->head);
+      printf("free list tail: %p\n", l->tail);
     }
-    if (GET_ALLOC(p) != 0) {
-      fprintf(stderr, "free block %p is not free\n", p);
+    // iterate through the free list
+    char *p = l->head;
+    while (p != NULL) {
+      if (verbose > 2) {
+        printf("free block: %p, size: %u\n", p, GET_SIZE(p));
+      }
+      if (GET_ALLOC(p) != 0) {
+        fprintf(stderr, "free block %p is not free\n", p);
+      }
+      if (GET_FWD_BLOCK(p) != NULL && GET_BCK_BLOCK(GET_FWD_BLOCK(p)) != p) {
+        fprintf(stderr, "free block %p forward pointer is not consistent\n", p);
+      }
+      if (GET_BCK_BLOCK(p) != NULL && GET_FWD_BLOCK(GET_BCK_BLOCK(p)) != p) {
+        fprintf(stderr, "free block %p backward pointer is not consistent\n", p);
+      }
+      p = GET_FWD_BLOCK(p);
     }
-    if (GET_FWD_BLOCK(p) != NULL && GET_BCK_BLOCK(GET_FWD_BLOCK(p)) != p) {
-      fprintf(stderr, "free block %p forward pointer is not consistent\n", p);
-    }
-    if (GET_BCK_BLOCK(p) != NULL && GET_FWD_BLOCK(GET_BCK_BLOCK(p)) != p) {
-      fprintf(stderr, "free block %p backward pointer is not consistent\n", p);
-    }
-    p = GET_FWD_BLOCK(p);
   }
 
   // check all blocks by address order
-  p = heap_head + PROLOGUE_SIZE;
+  char *p = heap_head + PROLOGUE_SIZE + ALIGN(HEADER_SIZE) - HEADER_SIZE;
   size_t p_size;
   size_t p_alloc;
   size_t prev_alloc = 1, p_prev_alloc;
@@ -346,7 +377,7 @@ void mm_checkheap(int verbose) {
       p_footer = GET(FOOTER_PTR(p));
       if (p_footer != GET(p)) {
         fprintf(stderr, "footer not consistent, block: %p, size: %lu, alloc: %lu, prev_alloc: %lu, footer: %lu\n", p,
-            p_size, p_alloc, p_prev_alloc, p_footer);
+                p_size, p_alloc, p_prev_alloc, p_footer);
         exit(1);
       }
     }
